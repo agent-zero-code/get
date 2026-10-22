@@ -87,7 +87,8 @@ code_app() {
   local a; for a in "$APPS/$APP_NAME" "$HOME_DIR/Applications/$APP_NAME"; do [ -d "$a" ] && { echo "$a"; return; }; done
   mdfind "kMDItemCFBundleIdentifier == 'com.microsoft.VSCode'" 2>/dev/null | head -1
 }
-claude_bin() { ls -d "$HOME_DIR"/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude 2>/dev/null | tail -1; }
+# Claude Code inside VS Code: the newest copy by its version, never by its folder's name (claude_in_vscode, written in below by the build).
+claude_bin() { claude_in_vscode "$HOME_DIR"; }
 
 # ── fetching a piece from its maker, and checking it before it is used ──
 work() { [ -n "$TMP" ] || { TMP="$(mktemp -d "${TMPDIR:-/tmp}/agent-zero-code-setup.XXXXXX")" && trap 'rm -rf "$TMP"' EXIT; }; [ -n "$TMP" ] && [ -d "$TMP" ]; }
@@ -98,15 +99,19 @@ signed_by() { codesign --verify --strict "$1" >/dev/null 2>&1 && codesign -dv --
 link_in() { mkdir -p "$LBIN" && ln -sf "$1" "$LBIN/$2" && ADDED=1; }
 refused() { note "$1 It was not installed."; return 1; }
 
+# Node comes with two helpers, npm and npx; the agent's own tools are started through npx, so all three are put in reach.
+link_node() { local t; for t in node npm npx; do [ -e "$1/bin/$t" ] && link_in "$1/bin/$t" "$t" || return 1; done; }
 get_node() { # the pinned version, from nodejs.org
-  work || return 1; local f="node-v$PIN_NODE-darwin-$ARCH.tar.gz" sum d
+  local f="node-v$PIN_NODE-darwin-$ARCH.tar.gz" sum d; d="${f%.tar.gz}"
+  [ -x "$SHARE/$d/bin/node" ] && { link_node "$SHARE/$d"; return; }   # fetched and checked by an earlier run: only put it in reach
+  work || return 1
   sum="$(pin_sum NODE "$ARCH")" || { note "This setup file carries no fingerprint for Node on this kind of Mac."; return 1; }
   note "Fetching ${f%.tar.gz} from nodejs.org (about 50 MB)…"
   fetch_big "https://nodejs.org/dist/v$PIN_NODE/$f" "$TMP/$f" || { note "nodejs.org could not be reached, or the download did not finish."; return 1; }
   sum_ok "$TMP/$f" "$sum" || { refused "The download is not the one this setup file was made for (its fingerprint differs)."; return 1; }
-  d="${f%.tar.gz}"; mkdir -p "$TMP/node-x" && tar -xzf "$TMP/$f" -C "$TMP/node-x" 2>/dev/null && [ -f "$TMP/node-x/$d/bin/node" ] || { note "The download could not be unpacked."; return 1; }
+  mkdir -p "$TMP/node-x" && tar -xzf "$TMP/$f" -C "$TMP/node-x" 2>/dev/null && [ -f "$TMP/node-x/$d/bin/node" ] || { note "The download could not be unpacked."; return 1; }
   signed_by "$TMP/node-x/$d/bin/node" "$TEAM_NODE" || { refused "The download is not signed by the Node.js Foundation."; return 1; }
-  mkdir -p "$SHARE" && { [ -d "$SHARE/$d" ] || mv "$TMP/node-x/$d" "$SHARE/$d"; } && link_in "$SHARE/$d/bin/node" node
+  mkdir -p "$SHARE" && { [ -d "$SHARE/$d" ] || mv "$TMP/node-x/$d" "$SHARE/$d"; } && link_node "$SHARE/$d"
 }
 
 get_jq() { # only an older Mac lacks it
@@ -143,19 +148,133 @@ get_vscode() { # the pinned version, from Microsoft's own server
 }
 
 # ── the truth file: what a copy is checked against ──
-# Whole: every file the truth file lists matches its fingerprint, and nothing is there that it does not list.
-whole() { local d="$1" bad extra
-  [ -s "$d/TRUTH.txt" ] || { note "It has no truth file (TRUTH.txt)."; return 1; }
-  if grep -Ev '^[0-9a-f]{64}  \./[^[:cntrl:]]+$' "$d/TRUTH.txt" | grep . >/dev/null || grep -e '\.\./' "$d/TRUTH.txt" >/dev/null; then note "Its truth file is not a plain list of fingerprints."; return 1; fi
-  bad="$(cd "$d" && shasum -a 256 -c TRUTH.txt 2>/dev/null | grep -v ': OK$' | head -3)"
-  [ -z "$bad" ] || { note "These do not match their fingerprints: $(printf '%s' "$bad" | sed 's/: .*//' | tr '\n' ' ')"; return 1; }
-  extra="$(cd "$d" && find . -type f ! -name TRUTH.txt ! -name TRUTH.sig ! -name .DS_Store ! -name '._*' ! -path './.git/*' | LC_ALL=C sort | comm -23 - <(sed -E 's/^[0-9a-f]{64}  //' TRUTH.txt | LC_ALL=C sort) | head -3)"
-  [ -z "$extra" ] || { note "These are in it and not in its truth file: $(printf '%s' "$extra" | tr '\n' ' ')"; return 1; }
+# The routine is not written here: the build writes it in, the same text as the product's own truth.sh carries (core/tools/truth-whole.sh).
+# >>> truth (written here by the build from core/tools/truth-whole.sh; change it there)
+# truth-whole.sh — the one way anything decides "is this copy whole?". It is a snippet, not a program: build-spoke.mjs writes
+# it into the product's truth.sh and into the setup file (which must stand alone, before anything is installed), and the maker's
+# own tools run it from here through core/tools/lib/truth.mjs. truth.test.sh runs one table of cases (fleet/spoke/truth-cases.json)
+# through all three.
+#
+#   truth_whole <folder> [<list> [<prefix>]]
+#     <list>    the truth file to check against (default <folder>/TRUTH.txt): one line per file, "<sha256>  ./<path>"
+#     <prefix>  only the list's lines under this folder are used, and are read as if it were the root (default ./). It is how a
+#               running copy (plugins/<name>) is checked against the list of the kit it was installed from. It must end in /.
+#   It prints one line: what is wrong, or "N files, each matches its fingerprint". When one file is to blame, a second line
+#   "file: <path>" names the first. It returns 0 whole · 1 not whole · 2 could not decide (it says why).
+#
+# A copy is whole when every file the list names matches its fingerprint, and nothing is in the folder that the list does not name.
+# What the list does not name and still may be there, and why:
+#   ./TRUTH.txt   the list itself (it cannot list its own fingerprint)            — only when the list is the folder's own
+#   ./TRUTH.sig   the provider's signature on the list; it is data and is checked by seal-kit.sh, not here — the root only, the same
+#   .DS_Store, ._*   what the Mac's Finder adds the moment someone opens a folder; data the system makes, never run — at any depth,
+#                    but ONLY as a plain file with no execute bit: one that could run is not exempt
+# Nothing else is exempt: not a .git folder, not a file by any other name. A symbolic link or any other special file (a pipe, a
+# socket) anywhere in the folder is refused outright, so a file cannot stand in for another by pointing at it.
+# This is an accident and damage check. The list sits beside the files it lists, so whoever can change the files can change the
+# list: it is not yet a seal against someone who can change the source (a signature and a chain lock are decided and not built).
+# A file the Mac itself adds, and may be let be: 0 yes, 1 no. Known two ways. It is a plain file with no execute mark (the rule as it was).
+# OR it IS what its name says: a ._NAME that begins with the AppleDouble signature (the four bytes 00 05 16 07) and has NAME beside it, a
+# .DS_Store that begins as the Finder writes it (00 00 00 01 "Bud1"). The second way is for a disk that keeps no execute mark: on a USB stick
+# every file reads as runnable, so the mark says nothing there and the file itself is read. The first bytes are compared by their fingerprint,
+# with the tools this routine already needs. (Found 2026-10-12: a copy filed on a stick failed its own check on the six ._ files the Mac added.)
+# What input makes this go red? A runnable ._ or .DS_Store that does not begin with its signature, or a ._NAME with no NAME beside it.
+_truth_mac() { # folder, ./path
+  local p="$1/${2#./}" b="${2##*/}" h
+  case "$b" in .DS_Store|._?*) ;; *) return 1 ;; esac
+  [ -n "$(find "$p" -maxdepth 0 \( -perm -100 -o -perm -010 -o -perm -001 \) 2>/dev/null)" ] || return 0
+  case "$b" in
+    .DS_Store) h="$(head -c 8 "$p" 2>/dev/null | shasum -a 256 2>/dev/null)"; [ "${h%% *}" = "c60d20d511de9eb88cd842833d175fc7cb79c6fe54fb4f3f4265b144ec39e7a6" ] ;;
+    *) h="$(head -c 4 "$p" 2>/dev/null | shasum -a 256 2>/dev/null)"; [ "${h%% *}" = "26af2039e3563c710de3d6585af9e7b430427ee7767b88b5723bf276186e0043" ] && [ -e "${p%/*}/${b#._}" ] ;;
+  esac
 }
+_truth_core() { # folder, selected list file (made by truth_whole), prefix
+  local d="$1" sel="$2" pre="$3" n odd extra out bad good first ex=()
+  n="$(wc -l < "$sel" | tr -d ' ')"
+  # a link or special file anywhere, first: a link makes the fingerprints below say nothing
+  odd="$(cd "$d" && find . ! -type f ! -type d 2>/dev/null)" || { echo "could not decide — the folder could not be read all the way"; return 2; }
+  if [ -n "$odd" ]; then first="$(printf '%s\n' "$odd" | LC_ALL=C sort | head -1)"; echo "It holds a link or a special file, and a copy never does: $(printf '%s\n' "$odd" | LC_ALL=C sort | head -3 | tr '\n' ' ')"; echo "file: ${first#./}"; return 1; fi
+  out="$(cd "$d" && shasum -a 256 -c "$sel" 2>/dev/null)"
+  bad="$(printf '%s\n' "$out" | grep -v ': OK$' | grep . | head -3)"; good="$(printf '%s\n' "$out" | grep -c ': OK$')"
+  if [ -n "$bad" ]; then first="$(printf '%s\n' "$bad" | head -1 | sed 's/: .*//')"; echo "These do not match their fingerprints: $(printf '%s\n' "$bad" | sed 's/: .*//' | tr '\n' ' ')"; echo "file: ${first#./}"; return 1; fi
+  [ "$good" -eq "$n" ] || { echo "could not decide — the fingerprints could not all be read"; return 2; }
+  [ "$pre" = "./" ] && ex=(! -path ./TRUTH.txt ! -path ./TRUTH.sig)
+  # What input makes this go red? A file in the folder that the list does not name, unless it is one the Mac itself adds (_truth_mac).
+  # Both lists are sorted and compared byte by byte (LC_ALL=C on comm too): in another language's order comm loses a match and calls a listed file a stranger.
+  extra="$(cd "$d" && find . -type f ${ex[@]+"${ex[@]}"} 2>/dev/null)" || { echo "could not decide — the folder could not be read all the way"; return 2; }
+  extra="$(printf '%s\n' "$extra" | grep . | LC_ALL=C sort | LC_ALL=C comm -23 - <(sed -E 's/^[0-9a-f]{64}  //' "$sel" | LC_ALL=C sort) | while IFS= read -r f; do _truth_mac "$d" "$f" || printf '%s\n' "$f"; done | head -3)"
+  if [ -n "$extra" ]; then echo "These are in it and not in its truth file: $(printf '%s\n' "$extra" | tr '\n' ' ')"; echo "file: $(printf '%s\n' "$extra" | head -1 | sed 's|^\./||')"; return 1; fi
+  echo "$n files, each matches its fingerprint"
+}
+truth_whole() {
+  local d="${1:-}" list="${2:-${1:-}/TRUTH.txt}" pre="${3:-./}" sel rc o
+  { [ -n "$d" ] && [ -d "$d" ] && (cd "$d") 2>/dev/null; } || { echo "could not decide — that folder is not there"; return 2; }
+  for o in shasum find awk comm sed mktemp head; do command -v "$o" >/dev/null 2>&1 || { echo "could not decide — $o is missing"; return 2; }; done
+  case "$pre" in *..*) echo "could not decide — the folder prefix is not a folder name"; return 2 ;; ./|./*/) ;; *) echo "could not decide — the folder prefix is not a folder name"; return 2 ;; esac
+  [ -s "$list" ] || { echo "It has no truth file (TRUTH.txt)"; return 1; }
+  if grep -Ev '^[0-9a-f]{64}  \./[^[:cntrl:]]+$' "$list" | grep . >/dev/null || grep -e '\.\./' "$list" >/dev/null; then echo "Its truth file is not a plain list of fingerprints"; return 1; fi
+  sel="$(mktemp "${TMPDIR:-/tmp}/truth.XXXXXX")" || { echo "could not decide — a working file could not be made"; return 2; }
+  LC_ALL=C awk -v p="$pre" '{ n = substr($0, 67); if (index(n, p) == 1) print substr($0, 1, 66) "./" substr(n, length(p) + 1) }' "$list" > "$sel" 2>/dev/null
+  if [ ! -s "$sel" ]; then rm -f "$sel"; echo "Its truth file lists nothing for this folder"; return 1; fi
+  _truth_core "$d" "$sel" "$pre"; rc=$?
+  rm -f "$sel"; return "$rc"
+}
+# <<< truth
+# Whole, said in this file's own voice: yes (0), or no (1) with the reason as a note, or could not decide (2), which also installs nothing.
+whole() { local r rc; r="$(truth_whole "$1")"; rc=$?; WHOLE_RC="$rc"; WHOLE_SAID="$(printf '%s\n' "$r" | head -1 | sed 's/ *$//')"
+  [ "$rc" -eq 0 ] || note "$WHOLE_SAID."; return "$rc"; }
 version_in() { sed -n 's/.*"version"[^"]*"\([0-9][0-9.]*\)".*/\1/p' "$1/plugins/agent-zero-code/.claude-plugin/plugin.json" 2>/dev/null | head -1; }
-newer() { # is version $1 newer than version $2
-  local a b i; IFS=. read -r -a a <<< "$1"; IFS=. read -r -a b <<< "$2"
-  for i in 0 1 2; do [ "${a[$i]:-0}" -gt "${b[$i]:-0}" ] 2>/dev/null && return 0; [ "${a[$i]:-0}" -lt "${b[$i]:-0}" ] 2>/dev/null && return 1; done; return 1; }
+# >>> semver (written here by the build from core/tools/semver.sh; change it there)
+# semver.sh — the one way the product's shell scripts compare two version numbers. It is a snippet, not a program: build-spoke.mjs
+# writes it into each shipped script that compares versions (so the setup file still stands alone). The same rule in JavaScript is
+# core/tools/semver.cjs; semver.test.sh runs one table of cases (fleet/spoke/semver-cases.json) through both.
+#
+# A version is three plain whole numbers with dots between them (1.3.2), at most 4, 5 and 6 digits. Leading zeros count as the
+# number (1.03.2 is 1.3.2). Anything else (a missing part, an extra part, a tail like -beta, a letter, a space, nothing) is NOT a
+# version: nothing is said and the return is 2 (could not decide), never "same" and never "older".
+#   semver_cmp A B   prints newer (A is newer than B), same, or older, and returns 0; prints nothing and returns 2 if either is not a version
+semver_cmp() {
+  local v p a1 a2 a3 b1 b2 b3 x y
+  for v in "$1" "$2"; do
+    case "$v" in ''|*[!0-9.]*|.*|*.|*..*) return 2 ;; esac
+    p="${v//[!.]/}"; [ "${#p}" -eq 2 ] || return 2
+  done
+  IFS=. read -r a1 a2 a3 <<< "$1"; IFS=. read -r b1 b2 b3 <<< "$2"
+  [ "${#a1}" -le 4 ] && [ "${#b1}" -le 4 ] && [ "${#a2}" -le 5 ] && [ "${#b2}" -le 5 ] && [ "${#a3}" -le 6 ] && [ "${#b3}" -le 6 ] || return 2
+  for p in "$a1 $b1" "$a2 $b2" "$a3 $b3"; do
+    x="${p% *}"; y="${p#* }"
+    if [ "$((10#$x))" -gt "$((10#$y))" ]; then echo newer; return 0; fi
+    if [ "$((10#$x))" -lt "$((10#$y))" ]; then echo older; return 0; fi
+  done
+  echo same
+}
+# <<< semver
+# >>> claude-vscode (written here by the build from core/tools/claude-vscode.sh; change it there)
+# claude-vscode.sh — the one way the product's shell scripts find Claude Code inside VS Code. It is a snippet, not a program: the
+# build writes it into each shipped script that looks there (the setup file, the updater, the reach report; the manifest lists them),
+# beside the version-compare snippet it uses (semver_cmp). Its JavaScript twin is the finder the Portal's server reads.
+#
+# VS Code keeps several copies of its Claude Code extension, each in a folder named for its version and machine
+# (anthropic.claude-code-2.1.304-darwin-x64). The newest is chosen by its VERSION, through semver_cmp, never by its name: by name
+# 2.1.99 comes after 2.1.100 (walk 137, Oct 21 2026: the setup, the reach report and the Portal's server each picked by name). A folder
+# whose version is not three plain numbers, or whose program is not there or cannot run, is passed over.
+#   claude_in_vscode <home>       prints the newest copy's program; nothing, and return 1, when there is none
+#   claude_in_vscode <home> all   prints every copy's program, newest first, one per line
+claude_in_vscode() {
+  local c v line best bv left="" all="${2:-}"
+  for c in "$1"/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude; do
+    [ -f "$c" ] && [ -x "$c" ] || continue
+    v="${c#"$1"/.vscode/extensions/anthropic.claude-code-}"; v="${v%%/*}"; v="${v%%-*}"
+    semver_cmp "$v" "$v" >/dev/null 2>&1 && left="${left:+$left$'\n'}$v $c"
+  done
+  [ -n "$left" ] || return 1
+  while [ -n "$left" ]; do
+    best=""; bv=""
+    while IFS= read -r line; do v="${line%% *}"; if [ -z "$bv" ] || [ "$(semver_cmp "$v" "$bv")" = newer ]; then bv="$v"; best="$line"; fi; done <<< "$left"
+    printf '%s\n' "${best#* }"; [ "$all" = all ] || return 0
+    left="$(printf '%s\n' "$left" | grep -vxF -- "$best" || true)"
+  done
+}
+# <<< claude-vscode
 
 # So that windows opened later find the tools put in ~/.local/bin: one marked line in the shell's own startup file.
 remember_path() {
@@ -192,7 +311,8 @@ echo "  Whatever is missing is fetched from its maker and checked. You sign in t
 if [ -n "$KIT" ]; then
   echo "  The copy in this folder installs your agent. GitHub is only for improvements afterwards."
   step "The copy you were handed"
-  if whole "$KIT"; then ok "$(wc -l < "$KIT/TRUTH.txt" | tr -d ' ') files, each matches its fingerprint"
+  if whole "$KIT"; then ok "$WHOLE_SAID"
+  elif [ "$WHOLE_RC" -eq 2 ]; then no "this copy could not be checked against its truth file, so nothing is installed from it"
   else no "this copy does not match its truth file, so nothing is installed from it"; fi
 fi
 
@@ -205,7 +325,12 @@ else
 fi
 
 step "Node (a small free tool the agent's scripts run on)"
-piece node get_node && ok "node $(node --version 2>/dev/null)" || no "node is not installed yet"
+if piece node get_node; then
+  # Node without its helper npx (an earlier setup left it so): the agent's tools could not start. Put right here.
+  if have npx || { [ -z "$CHECK" ] && get_node && have npx; }; then ok "node $(node --version 2>/dev/null)"
+  elif [ -n "$CHECK" ]; then no "node is here, but a helper it comes with (npx) is not in reach; setting up puts that right"
+  else no "node is here, but a helper it comes with (npx) could not be put in reach"; fi
+else no "node is not installed yet"; fi
 
 step "jq (a small free tool; newer Macs already have it)"
 piece jq get_jq && ok "jq is here" || no "jq is not installed yet"
@@ -213,12 +338,13 @@ piece jq get_jq && ok "jq is here" || no "jq is not installed yet"
 if [ -n "$KIT" ]; then step "Improvements, through GitHub (your agent works without this)"; else step "The GitHub tool, and this Mac signed in to GitHub"; fi
 if ! piece gh get_gh; then gap "the GitHub tool (gh) is not installed yet"
 else
-  if ! gh auth status >/dev/null 2>&1 && [ -z "$CHECK" ]; then
+  # A handed copy needs no GitHub to work (2026-10-18): the sign-in is not started here; the agent asks for it when an improvement needs it. That takes a sign-in out of the owner's install.
+  if ! gh auth status >/dev/null 2>&1 && [ -z "$CHECK" ] && [ -z "$KIT" ]; then
     echo "     → Signing this Mac in to GitHub. A browser window opens; sign in there. No password is typed here."
     if [ -n "$EVENTS" ]; then signin_github; else gh auth login --hostname github.com --git-protocol https --web; fi
   fi
   # Pointing git at that sign-in changes this Mac's git settings, so a check-only run leaves it alone.
-  if gh auth status >/dev/null 2>&1; then [ -n "$CHECK" ] || gh auth setup-git >/dev/null 2>&1; ok "this Mac is signed in to GitHub"; else gap "this Mac is not signed in to GitHub yet (run this file again to sign in)"; fi
+  if gh auth status >/dev/null 2>&1; then [ -n "$CHECK" ] || gh auth setup-git >/dev/null 2>&1; ok "this Mac is signed in to GitHub"; elif [ -n "$KIT" ]; then gap "this Mac is not signed in to GitHub yet; your agent works without it and asks when an improvement needs it"; else gap "this Mac is not signed in to GitHub yet (run this file again to sign in)"; fi
 fi
 
 [ -n "$KIT" ] || step "Your invitation to Agent Zero Code"
@@ -250,6 +376,14 @@ else
   "$CL" auth status >/dev/null 2>&1 && ok "signed in to Claude" || no "not signed in to Claude yet (run this file again to sign in)"
 fi
 
+# Installed is not the same as working (seen 2026-10-13: a copy installed whole while the program its browser starts with was out of
+# reach). Every tool the agent starts is named in the copy's .mcp.json by the program that starts it; each must be in reach.
+tools_reach() { local f="$1/plugins/agent-zero-code/.mcp.json" c bad=""
+  [ -n "$1" ] && [ -f "$f" ] || return 0
+  for c in $(grep -o '"command"[[:space:]]*:[[:space:]]*"[^"]*"' "$f" | sed 's/.*"\([^"]*\)"$/\1/' | sort -u); do have "$c" || bad="$bad $c"; done   # no jq: Apple's own tools only
+  if [ -n "$bad" ]; then no "your agent's own tools cannot start: missing$bad (run this file again; if it says this again, tell the person who invited you)"
+  else ok "your agent's own tools can start"; fi
+}
 step "Agent Zero Code itself"
 [ -n "$CHECK" ] || remember_path
 if [ "$MISSING" -gt 0 ]; then echo "     (waits until everything above has a ✓)"
@@ -260,7 +394,8 @@ else
     # From the copy you were handed, kept in your own home folder so it stays when the drive it came on goes.
     # Claude Code updates from that folder; an improvement is fetched into it later, from GitHub, and checked first.
     KEPT="$SHARE/kit"; VK="$(version_in "$KIT")"; VH="$(version_in "$KEPT")"
-    if [ -n "$VH" ] && newer "$VH" "$VK"; then note "A newer copy (version $VH) is already in place on this Mac. It was kept; the older one you were handed ($VK) was not put over it."
+    CMP="$(semver_cmp "$VH" "$VK")"; [ -z "$VH" ] || [ -n "$CMP" ] || note "Could not tell which copy is newer (the one in place says '$VH', the one you were handed says '$VK'), so the one you were handed is put in."
+    if [ "$CMP" = newer ]; then note "A newer copy (version $VH) is already in place on this Mac. It was kept; the older one you were handed ($VK) was not put over it."
     else mkdir -p "$KEPT" "$SHARE/provider" && rsync -a -c --delete --exclude .git "$KIT/" "$KEPT/" && printf '%s\n' "$REPO" > "$SHARE/provider/source.txt"; fi
     if whole "$KEPT"; then
       "$CL" plugin marketplace add "$KEPT" 2>&1 | tail -1 | sed 's/^/       /'
@@ -270,12 +405,21 @@ else
       "$CL" plugin update "$PLUGIN" >/dev/null 2>&1
     else note "The copy did not arrive whole in your home folder, so nothing was installed from it."; no "the new copy was not put in place (what was installed before is unchanged)"; fi
   else
+    # No folder was handed over: Claude Code fetches the catalogue from GitHub itself. What it fetched is checked against its truth
+    # file BEFORE anything is installed from it (a copy of its files without the .git folder, so the check sees exactly what would be
+    # installed). If that copy is not whole, or cannot be checked, nothing is installed, and what was installed before stays.
+    # What input makes this go red? A catalogue clone with one file changed, or no clone to look at.
     "$CL" plugin marketplace add "$REPO" 2>&1 | tail -1 | sed 's/^/       /'
     "$CL" plugin marketplace update "$HUB" >/dev/null 2>&1
-    "$CL" plugin install "$PLUGIN" 2>&1 | tail -1 | sed 's/^/       /'
-    "$CL" plugin update "$PLUGIN" >/dev/null 2>&1
+    CLONE="${CLAUDE_CONFIG_DIR:-$HOME_DIR/.claude}/plugins/marketplaces/$HUB"; SNAP="$(mktemp -d "${TMPDIR:-/tmp}/agent-zero-code-clone.XXXXXX" 2>/dev/null)"; GOT=""
+    if [ -n "$SNAP" ] && [ -d "$CLONE" ] && rsync -a --exclude .git "$CLONE/" "$SNAP/" 2>/dev/null; then whole "$SNAP" && GOT=1; else note "The copy Claude Code fetched from GitHub could not be looked at, so it could not be checked."; fi
+    [ -z "$SNAP" ] || rm -rf "$SNAP"
+    if [ -n "$GOT" ]; then
+      "$CL" plugin install "$PLUGIN" 2>&1 | tail -1 | sed 's/^/       /'
+      "$CL" plugin update "$PLUGIN" >/dev/null 2>&1
+    else note "Nothing was installed from it. What was installed before is unchanged."; no "the copy from GitHub was not checked as whole, so it was not installed (run this file again; if it says this again, tell the person who invited you)"; fi
   fi
-  if "$CL" plugin list 2>/dev/null | grep -q "agent-zero-code@"; then ok "Agent Zero Code is installed"; else no "Agent Zero Code did not install (send the lines above to the person who invited you)"; fi
+  if "$CL" plugin list 2>/dev/null | grep -q "agent-zero-code@"; then ok "Agent Zero Code is installed"; tools_reach "${KEPT:-${CLONE:-}}"; else no "Agent Zero Code did not install (send the lines above to the person who invited you)"; fi
 fi
 
 # ── the first check-up: what kind of Mac this is and what this setup found, for the person who set it up ──
@@ -291,7 +435,7 @@ if [ -z "$CHECK" ]; then
   CU="Agent Zero Code help report — $(date -u '+%Y-%m-%dT%H:%M:%SZ')
 kind: first check-up
 about: written by the setup file on this computer. What kind of Mac this is and what the setup found. No names, no files, nothing that was typed.
-os: $(sw_vers -productVersion 2>/dev/null || uname -sr) · node: $(tool node) · jq: $(tool jq) · git: $(tool git) · gh: $(tool gh)
+os: $(sw_vers -productVersion 2>/dev/null || uname -sr) · node: $(tool node) · jq: $(tool jq) · git: $(tool git) · gh: $(tool gh) · npx: $(tool npx)
 mac: chip $ARCH · memory ${MEM:-0} GB · free disk ${DISK:-unknown} GB
 installed from: $([ -n "$KIT" ] && echo "a copy handed over as a folder" || echo "GitHub")
 setup: $MISSING missing · $LATER left for later
@@ -327,15 +471,20 @@ if [ "$MISSING" -eq 0 ] && [ -z "$CHECK" ]; then
     HOME="$HOME_DIR" PORTAL_BUTTON_DIR="$DESK" CLAUDE_PLUGIN_ROOT="$PROOT" CLAUDE_PLUGIN_DATA="$PDATA" bash "$PROOT/scripts/portal.sh" --button "$START" >/dev/null 2>&1
     if [ -d "$DESK/My Portal.app" ]; then PORTAL="$DESK/My Portal.app"; elif [ -f "$DESK/Open my Portal.command" ]; then PORTAL="$DESK/Open my Portal.command"; fi
   fi
+  # Nothing the setup starts comes in front of the owner's work (2026-10-18). Led by a screen (the Claude app's move-in), nothing is opened here:
+  # the Portal opens once, after the hand-over, by the connector's open_my_portal; the end event names it. Run by a double-click, the Portal
+  # (or, failing that, VS Code) is the next screen and opens once here.
   if [ -n "$PORTAL" ]; then
-    echo "  All set. Your Portal is opening now. It is on your Desktop too: $(basename "$PORTAL" | sed 's/\.[a-z]*$//')."
+    if [ -n "$EVENTS" ]; then echo "  All set. Your Portal is on your Desktop: $(basename "$PORTAL" | sed 's/\.[a-z]*$//'). It opens once your answers are handed over."
+    else echo "  All set. Your Portal is opening now. It is on your Desktop too: $(basename "$PORTAL" | sed 's/\.[a-z]*$//')."; fi
     echo "    Answer its few questions there. Your agent takes it from there."; echo "    You can close this window."
-    [ "$LATER" -gt 0 ] && echo "  Your agent works as it is. It is not connected to GitHub yet, so improvements will not reach it: run this file again to connect."
-    open "$PORTAL" 2>/dev/null
+    [ "$LATER" -gt 0 ] && echo "  Your agent works as it is. It is not connected to GitHub yet; it asks you to connect when an improvement is ready."
+    [ -n "$EVENTS" ] || open "$PORTAL" 2>/dev/null
   else
-    echo "  All set. VS Code is opening on a new, empty folder: ~${START#"$HOME_DIR"}"; echo "    1. Click the Claude icon."; echo "    2. Type:  onboard me"
-    [ "$LATER" -gt 0 ] && echo "  Your agent works as it is. It is not connected to GitHub yet, so improvements will not reach it: run this file again to connect."
-    open -a "$VS" "$START" 2>/dev/null
+    if [ -n "$EVENTS" ]; then echo "  All set. Your agent's folder is ready: ~${START#"$HOME_DIR"}. Open VS Code on it when you want it, click the Claude icon and type: onboard me"
+    else echo "  All set. VS Code is opening on a new, empty folder: ~${START#"$HOME_DIR"}"; echo "    1. Click the Claude icon."; echo "    2. Type:  onboard me"; fi
+    [ "$LATER" -gt 0 ] && echo "  Your agent works as it is. It is not connected to GitHub yet; it asks you to connect when an improvement is ready."
+    [ -n "$EVENTS" ] || open -a "$VS" "$START" 2>/dev/null
   fi
 elif [ "$MISSING" -eq 0 ]; then echo "  Everything this Mac needs is in place."
 else echo "  $MISSING thing(s) still missing, marked ✗ above. Double-click this file again when they are done."; fi
